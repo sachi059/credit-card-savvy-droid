@@ -4,6 +4,9 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'dart:convert';
 import 'package:uuid/uuid.dart';
 import 'package:intl/intl.dart';
+import 'package:url_launcher/url_launcher.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:http/http.dart' as http;
 
 void main() {
   runApp(const MyApp());
@@ -71,7 +74,7 @@ class CreditCard {
       ),
       statementDate: json['statementDate'],
       billingDate: json['billingDate'],
-      creditLimit: json['creditLimit'],
+      creditLimit: json['creditLimit'] != null ? json['creditLimit'].toDouble() : null,
       color: json['color'] != null ? Color(int.parse(json['color'])) : null,
     );
   }
@@ -179,6 +182,12 @@ class CardStorage {
       final prefs = await SharedPreferences.getInstance();
       final encoded = jsonEncode(cards.map((card) => card.toJson()).toList());
       await prefs.setString(storageKey, encoded);
+
+      // After saving locally, sync to GitHub if possible
+      final githubSync = GitHubSync();
+      if (await githubSync.isAuthenticated()) {
+        await githubSync.syncData(encoded);
+      }
     } catch (e) {
       print('Failed to save cards to storage: $e');
     }
@@ -206,6 +215,132 @@ class CardStorage {
   }
 }
 
+// GitHub Sync Implementation
+class GitHubSync {
+  final _secureStorage = const FlutterSecureStorage();
+  final String _tokenKey = 'github_token';
+  final String _usernameKey = 'github_username';
+  final String _repoKey = 'github_repo';
+
+  Future<bool> isAuthenticated() async {
+    return await _secureStorage.containsKey(key: _tokenKey);
+  }
+
+  Future<void> saveCredentials(String token, String username, String repo) async {
+    await _secureStorage.write(key: _tokenKey, value: token);
+    await _secureStorage.write(key: _usernameKey, value: username);
+    await _secureStorage.write(key: _repoKey, value: repo);
+  }
+
+  Future<Map<String, String?>> getCredentials() async {
+    return {
+      'token': await _secureStorage.read(key: _tokenKey),
+      'username': await _secureStorage.read(key: _usernameKey),
+      'repo': await _secureStorage.read(key: _repoKey),
+    };
+  }
+
+  Future<void> clearCredentials() async {
+    await _secureStorage.delete(key: _tokenKey);
+    await _secureStorage.delete(key: _usernameKey);
+    await _secureStorage.delete(key: _repoKey);
+  }
+
+  Future<void> syncData(String data) async {
+    try {
+      final credentials = await getCredentials();
+      final token = credentials['token'];
+      final username = credentials['username'];
+      final repo = credentials['repo'];
+
+      if (token == null || username == null || repo == null) {
+        throw Exception('GitHub credentials not set');
+      }
+
+      final fileName = 'credit_card_data.json';
+      final content = base64Encode(utf8.encode(data));
+      final message = 'Update credit card data ${DateTime.now().toIso8601String()}';
+
+      // Get current file SHA (if exists)
+      String? sha;
+      final getShaResponse = await http.get(
+        Uri.parse('https://api.github.com/repos/$username/$repo/contents/$fileName'),
+        headers: {
+          'Authorization': 'token $token',
+          'Accept': 'application/vnd.github.v3+json',
+        },
+      );
+
+      if (getShaResponse.statusCode == 200) {
+        final fileInfo = jsonDecode(getShaResponse.body);
+        sha = fileInfo['sha'];
+      }
+
+      // Create or update file
+      final Map<String, dynamic> body = {
+        'message': message,
+        'content': content,
+      };
+
+      if (sha != null) {
+        body['sha'] = sha;
+      }
+
+      final response = await http.put(
+        Uri.parse('https://api.github.com/repos/$username/$repo/contents/$fileName'),
+        headers: {
+          'Authorization': 'token $token',
+          'Content-Type': 'application/json',
+          'Accept': 'application/vnd.github.v3+json',
+        },
+        body: jsonEncode(body),
+      );
+
+      if (response.statusCode != 200 && response.statusCode != 201) {
+        throw Exception('Failed to sync data: ${response.body}');
+      }
+    } catch (e) {
+      print('Error syncing to GitHub: $e');
+    }
+  }
+
+  Future<String?> loadDataFromGitHub() async {
+    try {
+      final credentials = await getCredentials();
+      final token = credentials['token'];
+      final username = credentials['username'];
+      final repo = credentials['repo'];
+
+      if (token == null || username == null || repo == null) {
+        return null;
+      }
+
+      final fileName = 'credit_card_data.json';
+      final response = await http.get(
+        Uri.parse('https://api.github.com/repos/$username/$repo/contents/$fileName'),
+        headers: {
+          'Authorization': 'token $token',
+          'Accept': 'application/vnd.github.v3+json',
+        },
+      );
+
+      if (response.statusCode == 200) {
+        final fileInfo = jsonDecode(response.body);
+        final content = fileInfo['content'];
+        final encoding = fileInfo['encoding'];
+        
+        if (encoding == 'base64') {
+          return utf8.decode(base64Decode(content.replaceAll('\n', '')));
+        }
+      }
+      return null;
+    } catch (e) {
+      print('Error loading data from GitHub: $e');
+      return null;
+    }
+  }
+}
+
 // Home Page (Dashboard)
 class HomePage extends StatefulWidget {
   const HomePage({Key? key}) : super(key: key);
@@ -217,20 +352,158 @@ class HomePage extends StatefulWidget {
 class _HomePageState extends State<HomePage> {
   List<CreditCard> _cards = [];
   bool _isLoading = true;
-
+  bool _showGitHubSetup = false;
+  final GitHubSync _githubSync = GitHubSync();
+  
   @override
   void initState() {
     super.initState();
     _loadCards();
+    _checkGitHubStatus();
+  }
+
+  Future<void> _checkGitHubStatus() async {
+    final isAuthenticated = await _githubSync.isAuthenticated();
+    setState(() {
+      _showGitHubSetup = !isAuthenticated;
+    });
   }
 
   Future<void> _loadCards() async {
     setState(() => _isLoading = true);
+    
+    // First try to load from GitHub if authenticated
+    if (await _githubSync.isAuthenticated()) {
+      final githubData = await _githubSync.loadDataFromGitHub();
+      if (githubData != null) {
+        try {
+          final List<dynamic> decoded = jsonDecode(githubData);
+          final githubCards = decoded.map((item) => CreditCard.fromJson(item)).toList();
+          
+          // Save the GitHub data to local storage
+          final prefs = await SharedPreferences.getInstance();
+          await prefs.setString(CardStorage.storageKey, githubData);
+          
+          setState(() {
+            _cards = githubCards;
+            _isLoading = false;
+          });
+          return;
+        } catch (e) {
+          print('Error parsing GitHub data: $e');
+        }
+      }
+    }
+    
+    // Fallback to local storage
     final cards = await CardStorage.getCards();
-    setState(() {
-      _cards = cards;
-      _isLoading = false;
-    });
+    if (mounted) {
+      setState(() {
+        _cards = cards;
+        _isLoading = false;
+      });
+    }
+  }
+
+  Future<void> _showGitHubLoginDialog() async {
+    final tokenController = TextEditingController();
+    final usernameController = TextEditingController();
+    final repoController = TextEditingController();
+    
+    return showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('GitHub Integration'),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text(
+                'Sync your credit card data with a GitHub repository.\n\n'
+                'You\'ll need a personal access token with repo scope.',
+                style: TextStyle(fontSize: 14),
+              ),
+              const SizedBox(height: 16),
+              TextButton(
+                onPressed: () async {
+                  final url = Uri.parse('https://github.com/settings/tokens/new');
+                  if (await canLaunchUrl(url)) {
+                    await launchUrl(url, mode: LaunchMode.externalApplication);
+                  }
+                },
+                child: const Text('Create GitHub Token'),
+              ),
+              const SizedBox(height: 8),
+              TextField(
+                controller: tokenController,
+                decoration: const InputDecoration(
+                  labelText: 'GitHub Token',
+                  border: OutlineInputBorder(),
+                ),
+                obscureText: true,
+              ),
+              const SizedBox(height: 16),
+              TextField(
+                controller: usernameController,
+                decoration: const InputDecoration(
+                  labelText: 'GitHub Username',
+                  border: OutlineInputBorder(),
+                ),
+              ),
+              const SizedBox(height: 16),
+              TextField(
+                controller: repoController,
+                decoration: const InputDecoration(
+                  labelText: 'Repository Name',
+                  border: OutlineInputBorder(),
+                ),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            onPressed: () async {
+              if (tokenController.text.isNotEmpty && 
+                  usernameController.text.isNotEmpty && 
+                  repoController.text.isNotEmpty) {
+                await _githubSync.saveCredentials(
+                  tokenController.text, 
+                  usernameController.text, 
+                  repoController.text
+                );
+                
+                // Test the connection and sync initial data
+                try {
+                  final cards = await CardStorage.getCards();
+                  final encoded = jsonEncode(cards.map((card) => card.toJson()).toList());
+                  await _githubSync.syncData(encoded);
+                  
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('GitHub integration successful')),
+                  );
+                  
+                  setState(() {
+                    _showGitHubSetup = false;
+                  });
+                } catch (e) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(content: Text('GitHub integration failed: $e')),
+                  );
+                }
+                
+                Navigator.of(context).pop();
+              }
+            },
+            child: const Text('Connect'),
+          ),
+        ],
+      ),
+    );
   }
 
   @override
@@ -240,6 +513,49 @@ class _HomePageState extends State<HomePage> {
         title: const Text('Credit Card Savvy'),
         elevation: 0,
         centerTitle: true,
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.sync),
+            onPressed: () async {
+              if (await _githubSync.isAuthenticated()) {
+                await _loadCards();
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('Data synchronized with GitHub')),
+                );
+              } else {
+                _showGitHubLoginDialog();
+              }
+            },
+            tooltip: 'Sync with GitHub',
+          ),
+          PopupMenuButton<String>(
+            onSelected: (value) async {
+              if (value == 'github_setup') {
+                _showGitHubLoginDialog();
+              } else if (value == 'github_disconnect') {
+                await _githubSync.clearCredentials();
+                setState(() {
+                  _showGitHubSetup = true;
+                });
+                if (mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('GitHub disconnected')),
+                  );
+                }
+              }
+            },
+            itemBuilder: (context) => [
+              const PopupMenuItem(
+                value: 'github_setup',
+                child: Text('Setup GitHub Sync'),
+              ),
+              const PopupMenuItem(
+                value: 'github_disconnect',
+                child: Text('Disconnect GitHub'),
+              ),
+            ],
+          ),
+        ],
       ),
       floatingActionButton: FloatingActionButton(
         onPressed: () async {
@@ -251,80 +567,123 @@ class _HomePageState extends State<HomePage> {
         },
         child: const Icon(Icons.add),
       ),
-      body: _isLoading
-          ? const Center(child: CircularProgressIndicator())
-          : _cards.isEmpty
-              ? Center(
-                  child: Column(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      const Icon(Icons.credit_card, size: 64, color: Colors.grey),
-                      const SizedBox(height: 16),
-                      const Text(
-                        'No credit cards yet',
-                        style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-                      ),
-                      const SizedBox(height: 8),
-                      const Text(
-                        'Add a card to get started',
-                        style: TextStyle(color: Colors.grey),
-                      ),
-                      const SizedBox(height: 24),
-                      ElevatedButton(
-                        onPressed: () async {
-                          await Navigator.push(
-                            context,
-                            MaterialPageRoute(builder: (context) => CardFormPage()),
-                          );
-                          _loadCards();
-                        },
-                        child: const Text('Add Card'),
-                      ),
-                    ],
-                  ),
-                )
-              : RefreshIndicator(
-                  onRefresh: _loadCards,
-                  child: SingleChildScrollView(
-                    physics: const AlwaysScrollableScrollPhysics(),
-                    padding: const EdgeInsets.all(16),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        // Best Card Recommendation
-                        if (_cards.isNotEmpty) 
-                          BestCardWidget(bestCard: getBestCard(_cards)),
-                        
-                        const SizedBox(height: 24),
-                        const Text(
-                          'Your Cards',
-                          style: TextStyle(
-                            fontSize: 20,
-                            fontWeight: FontWeight.bold,
+      body: Stack(
+        children: [
+          _isLoading
+              ? const Center(child: CircularProgressIndicator())
+              : _cards.isEmpty
+                  ? Center(
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          const Icon(Icons.credit_card, size: 64, color: Colors.grey),
+                          const SizedBox(height: 16),
+                          const Text(
+                            'No credit cards yet',
+                            style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
                           ),
-                        ),
-                        const SizedBox(height: 16),
-                        
-                        // Card List
-                        ..._cards.map((card) => Padding(
-                          padding: const EdgeInsets.only(bottom: 12),
-                          child: CreditCardItem(
-                            card: card,
-                            onTap: () async {
+                          const SizedBox(height: 8),
+                          const Text(
+                            'Add a card to get started',
+                            style: TextStyle(color: Colors.grey),
+                          ),
+                          const SizedBox(height: 24),
+                          ElevatedButton(
+                            onPressed: () async {
                               await Navigator.push(
                                 context,
-                                MaterialPageRoute(
-                                  builder: (context) => CardDetailPage(card: card),
-                                ),
+                                MaterialPageRoute(builder: (context) => CardFormPage()),
                               );
                               _loadCards();
                             },
+                            child: const Text('Add Card'),
                           ),
-                        )).toList(),
-                      ],
+                        ],
+                      ),
+                    )
+                  : RefreshIndicator(
+                      onRefresh: _loadCards,
+                      child: SingleChildScrollView(
+                        physics: const AlwaysScrollableScrollPhysics(),
+                        padding: const EdgeInsets.all(16),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            // Best Card Recommendation
+                            if (_cards.isNotEmpty) 
+                              BestCardWidget(bestCard: getBestCard(_cards)),
+                            
+                            const SizedBox(height: 24),
+                            const Text(
+                              'Your Cards',
+                              style: TextStyle(
+                                fontSize: 20,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                            const SizedBox(height: 16),
+                            
+                            // Card List
+                            ..._cards.map((card) => Padding(
+                              padding: const EdgeInsets.only(bottom: 12),
+                              child: CreditCardItem(
+                                card: card,
+                                onTap: () async {
+                                  await Navigator.push(
+                                    context,
+                                    MaterialPageRoute(
+                                      builder: (context) => CardDetailPage(card: card),
+                                    ),
+                                  );
+                                  _loadCards();
+                                },
+                              ),
+                            )).toList(),
+                          ],
+                        ),
+                      ),
                     ),
-                  ),
+                    
+          // GitHub setup reminder banner
+          if (_showGitHubSetup)
+            Positioned(
+              bottom: 0,
+              left: 0,
+              right: 0,
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                color: Colors.blue.withOpacity(0.9),
+                child: Row(
+                  children: [
+                    const Icon(Icons.sync, color: Colors.white),
+                    const SizedBox(width: 12),
+                    const Expanded(
+                      child: Text(
+                        'Sync your data with GitHub',
+                        style: TextStyle(color: Colors.white),
+                      ),
+                    ),
+                    TextButton(
+                      onPressed: _showGitHubLoginDialog,
+                      style: TextButton.styleFrom(
+                        backgroundColor: Colors.white,
+                      ),
+                      child: const Text('Setup'),
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.close, color: Colors.white),
+                      onPressed: () {
+                        setState(() {
+                          _showGitHubSetup = false;
+                        });
+                      },
+                    ),
+                  ],
                 ),
+              ),
+            ),
+        ],
+      ),
     );
   }
 }
