@@ -16,6 +16,12 @@ const config: CapacitorConfig = {
       keystorePassword: undefined,
       keystoreAliasPassword: undefined,
     }
+  },
+  plugins: {
+    FirebaseAuthentication: {
+      skipNativeAuth: false,
+      providers: ["google.com"]
+    }
   }
 };
 
